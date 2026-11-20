@@ -36,8 +36,12 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/urfave/cli/v2"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/textlogger"
@@ -499,6 +503,38 @@ func runManager(ctx *cli.Context, info *version.Info) error {
 
 	setControllerOptionsForNamespaces(&ctrlOpts)
 
+	// Upgrades from 0.10.x: the CRDs convert through the webhook pods, which
+	// the old operator deployed with its own image. Roll them to this image
+	// before the manager starts, since its caches can't sync until the
+	// conversion works.
+	if err := bootstrapWebhookImage(ctx.Context, cfg); err != nil {
+		setupLog.Error(err, "bootstrapping webhook image")
+	}
+
+	// On the 0.10.x CRDs, wait for the 1.0 CRDs instead of crashing.
+	for logged := false; ; {
+		served, err := spoV1Served(cfg)
+		if err != nil {
+			return fmt.Errorf("discover SPO v1 API: %w", err)
+		}
+
+		if served {
+			break
+		}
+
+		if !logged {
+			setupLog.Info("SPO v1 API not served yet, waiting for the 1.0 CRDs")
+
+			logged = true
+		}
+
+		select {
+		case <-sigHandler.Done():
+			return nil
+		case <-time.After(10 * time.Second):
+		}
+	}
+
 	mgr, err := ctrl.NewManager(cfg, ctrlOpts)
 	if err != nil {
 		return fmt.Errorf("create cluster manager: %w", err)
@@ -583,6 +619,69 @@ func runManager(ctx *cli.Context, info *version.Info) error {
 	setupLog.Info("ending manager")
 
 	return nil
+}
+
+func bootstrapWebhookImage(ctx context.Context, cfg *rest.Config) error {
+	c, err := client.New(cfg, client.Options{})
+	if err != nil {
+		return fmt.Errorf("create client: %w", err)
+	}
+
+	ns := config.GetOperatorNamespace()
+
+	operator := &appsv1.Deployment{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: config.OperatorName}, operator); err != nil {
+		return fmt.Errorf("get operator deployment: %w", err)
+	}
+
+	hook := &appsv1.Deployment{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: config.OperatorName + "-webhook"}, hook); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+
+		return fmt.Errorf("get webhook deployment: %w", err)
+	}
+
+	image := operator.Spec.Template.Spec.Containers[0].Image
+	if len(hook.Spec.Template.Spec.Containers) == 0 || hook.Spec.Template.Spec.Containers[0].Image == image {
+		return nil
+	}
+
+	patch := client.MergeFrom(hook.DeepCopy())
+	hook.Spec.Template.Spec.Containers[0].Image = image
+
+	if err := c.Patch(ctx, hook, patch); err != nil {
+		return fmt.Errorf("patch webhook deployment: %w", err)
+	}
+
+	setupLog.Info("rolled webhook deployment to operator image", "image", image)
+
+	return nil
+}
+
+func spoV1Served(cfg *rest.Config) (bool, error) {
+	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return false, fmt.Errorf("create discovery client: %w", err)
+	}
+
+	resources, err := dc.ServerResourcesForGroupVersion(spodv1.GroupVersion.String())
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("get server resources: %w", err)
+	}
+
+	for i := range resources.APIResources {
+		if resources.APIResources[i].Kind == "SecurityProfilesOperatorDaemon" {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 func setControllerOptionsForNamespaces(opts *ctrl.Options) {
@@ -936,6 +1035,23 @@ func runWebhook(ctx *cli.Context, info *version.Info) error {
 
 	if err := profilerecordingv1.AddToScheme(mgr.GetScheme()); err != nil {
 		return fmt.Errorf("add profilerecording v1 API to scheme: %w", err)
+	}
+
+	// Required by the conversion webhook for objects stored by 0.10.x.
+	if err := spodv1alpha1.AddToScheme(mgr.GetScheme()); err != nil {
+		return fmt.Errorf("add spod API to scheme: %w", err)
+	}
+
+	if err := spodv1.AddToScheme(mgr.GetScheme()); err != nil {
+		return fmt.Errorf("add spod v1 API to scheme: %w", err)
+	}
+
+	if err := secprofnodestatusv1alpha1.AddToScheme(mgr.GetScheme()); err != nil {
+		return fmt.Errorf("add secprofnodestatus API to scheme: %w", err)
+	}
+
+	if err := secprofnodestatusv1.AddToScheme(mgr.GetScheme()); err != nil {
+		return fmt.Errorf("add secprofnodestatus v1 API to scheme: %w", err)
 	}
 
 	setupLog.Info("registering webhooks")

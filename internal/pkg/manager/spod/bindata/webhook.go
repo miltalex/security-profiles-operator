@@ -471,7 +471,15 @@ func namespaceSelectorUnequalForLabel(label string, existing, configured *metav1
 func (w *Webhook) Update(ctx context.Context, c client.Client) error {
 	for k, o := range w.objectMap() {
 		if err := c.Patch(ctx, o, client.Merge); err != nil {
-			return fmt.Errorf("updating %s: %w", k, err)
+			// Objects added in 1.0, like the validating webhook
+			// configuration, don't exist on upgrades from 0.10.x.
+			if !errors.IsNotFound(err) {
+				return fmt.Errorf("updating %s: %w", k, err)
+			}
+
+			if err := c.Create(ctx, o); err != nil {
+				return fmt.Errorf("creating %s: %w", k, err)
+			}
 		}
 	}
 

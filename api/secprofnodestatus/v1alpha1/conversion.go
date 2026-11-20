@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"sigs.k8s.io/controller-runtime/pkg/conversion"
@@ -50,4 +51,72 @@ func (dst *SecurityProfileNodeStatus) ConvertFrom(srcRaw conversion.Hub) error {
 	dst.Status.Status = ProfileState(src.Status.Status)
 
 	return nil
+}
+
+// UnmarshalJSON also accepts objects stored by 0.10.x, which keep nodeName
+// and the state string at the top level instead of in spec and status.
+func (s *SecurityProfileNodeStatus) UnmarshalJSON(data []byte) error {
+	type plain SecurityProfileNodeStatus
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+
+	var state string
+	if raw, ok := fields["status"]; ok && json.Unmarshal(raw, &state) == nil {
+		status, err := json.Marshal(SecurityProfileNodeStatusStatus{Status: ProfileState(state)})
+		if err != nil {
+			return err
+		}
+
+		fields["status"] = status
+
+		// The API server prunes the top-level nodeName before conversion,
+		// the node name label of 0.10.x keeps it.
+		var nodeName string
+		if raw, ok := fields["nodeName"]; ok {
+			if err := json.Unmarshal(raw, &nodeName); err != nil {
+				return err
+			}
+		}
+
+		if nodeName == "" {
+			var meta struct {
+				Labels map[string]string `json:"labels"`
+			}
+			if raw, ok := fields["metadata"]; ok {
+				if err := json.Unmarshal(raw, &meta); err != nil {
+					return err
+				}
+			}
+
+			nodeName = meta.Labels["spo.x-k8s.io/node-name"]
+		}
+
+		if nodeName != "" {
+			spec := SecurityProfileNodeStatusSpec{}
+			if raw, ok := fields["spec"]; ok {
+				if err := json.Unmarshal(raw, &spec); err != nil {
+					return err
+				}
+			}
+
+			if spec.NodeName == "" {
+				spec.NodeName = nodeName
+			}
+
+			if fields["spec"], err = json.Marshal(spec); err != nil {
+				return err
+			}
+		}
+
+		delete(fields, "nodeName")
+
+		if data, err = json.Marshal(fields); err != nil {
+			return err
+		}
+	}
+
+	return json.Unmarshal(data, (*plain)(s))
 }
